@@ -11,20 +11,14 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"net"
-	"net/mail"
-	"net/url"
 	"os"
 	"os/exec"
 	"os/user"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"runtime/debug"
 	"strings"
 	"sync"
-
-	"golang.org/x/net/idna"
 )
 
 const shortUsage = `Usage of mkcert:
@@ -211,27 +205,6 @@ func (m *mkcert) Run(args []string) {
 	if len(args) == 0 {
 		flag.Usage()
 		return
-	}
-
-	hostnameRegexp := regexp.MustCompile(`(?i)^(\*\.)?[0-9a-z_-]([0-9a-z._-]*[0-9a-z_-])?$`)
-	for i, name := range args {
-		if ip := net.ParseIP(name); ip != nil {
-			continue
-		}
-		if email, err := mail.ParseAddress(name); err == nil && email.Address == name {
-			continue
-		}
-		if uriName, err := url.Parse(name); err == nil && uriName.Scheme != "" && uriName.Host != "" {
-			continue
-		}
-		punycode, err := idna.ToASCII(name)
-		if err != nil {
-			log.Fatalf("ERROR: %q is not a valid hostname, IP, URL or email: %s", name, err)
-		}
-		args[i] = punycode
-		if !hostnameRegexp.MatchString(punycode) {
-			log.Fatalf("ERROR: %q is not a valid hostname, IP, URL or email", name)
-		}
 	}
 
 	m.makeCert(args)
