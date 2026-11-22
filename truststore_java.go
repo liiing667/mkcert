@@ -79,11 +79,15 @@ func (m *mkcert) checkJava() bool {
 }
 
 func (m *mkcert) installJava() {
+	certFile, cleanup, err := m.trustStoreCertFile()
+	fatalIfErr(err, "failed to write the CA certificate")
+	defer cleanup()
+
 	args := []string{
 		"-importcert", "-noprompt",
 		"-keystore", cacertsPath,
 		"-storepass", storePass,
-		"-file", filepath.Join(m.CAROOT, rootName),
+		"-file", certFile,
 		"-alias", m.caUniqueName(),
 	}
 

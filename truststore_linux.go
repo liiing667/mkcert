@@ -7,7 +7,6 @@ package main
 import (
 	"bytes"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"os"
 	"path/filepath"
@@ -59,8 +58,7 @@ func (m *mkcert) installPlatform() bool {
 		return false
 	}
 
-	cert, err := ioutil.ReadFile(filepath.Join(m.CAROOT, rootName))
-	fatalIfErr(err, "failed to read root certificate")
+	cert := m.caCertPEM()
 
 	cmd := commandWithSudo("tee", m.systemTrustFilename())
 	cmd.Stdin = bytes.NewReader(cert)

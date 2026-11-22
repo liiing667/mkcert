@@ -10,7 +10,6 @@ import (
 	"io/ioutil"
 	"log"
 	"os"
-	"path/filepath"
 
 	"howett.net/plist"
 )
@@ -50,7 +49,11 @@ var trustSettingsData = []byte(`
 `)
 
 func (m *mkcert) installPlatform() bool {
-	cmd := commandWithSudo("security", "add-trusted-cert", "-d", "-k", "/Library/Keychains/System.keychain", filepath.Join(m.CAROOT, rootName))
+	certFile, cleanup, err := m.trustStoreCertFile()
+	fatalIfErr(err, "failed to write the CA certificate")
+	defer cleanup()
+
+	cmd := commandWithSudo("security", "add-trusted-cert", "-d", "-k", "/Library/Keychains/System.keychain", certFile)
 	out, err := cmd.CombinedOutput()
 	fatalIfCmdErr(err, "security add-trusted-cert", out)
 
@@ -103,7 +106,11 @@ func (m *mkcert) installPlatform() bool {
 }
 
 func (m *mkcert) uninstallPlatform() bool {
-	cmd := commandWithSudo("security", "remove-trusted-cert", "-d", filepath.Join(m.CAROOT, rootName))
+	certFile, cleanup, err := m.trustStoreCertFile()
+	fatalIfErr(err, "failed to write the CA certificate")
+	defer cleanup()
+
+	cmd := commandWithSudo("security", "remove-trusted-cert", "-d", certFile)
 	out, err := cmd.CombinedOutput()
 	fatalIfCmdErr(err, "security remove-trusted-cert", out)
 

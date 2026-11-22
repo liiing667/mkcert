@@ -87,8 +87,12 @@ func (m *mkcert) checkNSS() bool {
 }
 
 func (m *mkcert) installNSS() bool {
+	certFile, cleanup, err := m.trustStoreCertFile()
+	fatalIfErr(err, "failed to write the CA certificate")
+	defer cleanup()
+
 	if m.forEachNSSProfile(func(profile string) {
-		cmd := exec.Command(certutilPath, "-A", "-d", profile, "-t", "C,,", "-n", m.caUniqueName(), "-i", filepath.Join(m.CAROOT, rootName))
+		cmd := exec.Command(certutilPath, "-A", "-d", profile, "-t", "C,,", "-n", m.caUniqueName(), "-i", certFile)
 		out, err := execCertutil(cmd)
 		fatalIfCmdErr(err, "certutil -A -d "+profile, out)
 	}) == 0 {

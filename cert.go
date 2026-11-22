@@ -5,6 +5,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -15,6 +16,8 @@ import (
 	"crypto/x509/pkix"
 	"encoding/asn1"
 	"encoding/pem"
+	"errors"
+	"fmt"
 	"io/ioutil"
 	"log"
 	"math/big"
@@ -50,6 +53,24 @@ func init() {
 func (m *mkcert) makeCert(hosts []string) {
 	if m.caKey == nil {
 		log.Fatalln("ERROR: can't create new certificates because the CA key (rootCA-key.pem) is missing")
+	}
+	if m.caCert == nil {
+		log.Fatalln("ERROR: can't create new certificates because the CA certificate is missing")
+	}
+	fatalIfErr(checkCAKeyPair(m.caCert, m.caKey), "the CA certificate and key do not match")
+	if m.CAROOT != "" {
+		fatalIfErr(secureMkdirAll(m.CAROOT), "failed to create the CAROOT")
+	}
+
+	certFile, keyFile, p12File := m.fileNames(hosts)
+	if !m.pkcs12 {
+		m.checkOutputPath(certFile, "certificate")
+		m.checkOutputPath(keyFile, "key")
+		fatalIfErr(validateExistingOutput(certFile, false), "failed to save certificate")
+		fatalIfErr(validateExistingOutput(keyFile, true), "failed to save certificate key")
+	} else {
+		m.checkOutputPath(p12File, "PKCS#12 bundle")
+		fatalIfErr(validateExistingOutput(p12File, true), "failed to save PKCS#12")
 	}
 
 	priv, err := m.generateKey(false)
@@ -104,35 +125,35 @@ func (m *mkcert) makeCert(hosts []string) {
 	cert, err := x509.CreateCertificate(rand.Reader, tpl, m.caCert, pub, m.caKey)
 	fatalIfErr(err, "failed to generate certificate")
 
-	certFile, keyFile, p12File := m.fileNames(hosts)
-
 	if !m.pkcs12 {
 		certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert})
 		privDER, err := x509.MarshalPKCS8PrivateKey(priv)
 		fatalIfErr(err, "failed to encode certificate key")
 		privPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: privDER})
 
-		if certFile == keyFile {
-			err = ioutil.WriteFile(keyFile, append(certPEM, privPEM...), 0600)
+		if samePath(certFile, keyFile) {
+			combined := append(append([]byte{}, certPEM...), privPEM...)
+			err = writeAllAtomic([]atomicWrite{{certFile, combined, 0600, true, false}})
 			fatalIfErr(err, "failed to save certificate and key")
 		} else {
-			err = ioutil.WriteFile(certFile, certPEM, 0644)
-			fatalIfErr(err, "failed to save certificate")
-			err = ioutil.WriteFile(keyFile, privPEM, 0600)
-			fatalIfErr(err, "failed to save certificate key")
+			err = writeAllAtomic([]atomicWrite{
+				{certFile, certPEM, 0644, false, false},
+				{keyFile, privPEM, 0600, true, false},
+			})
+			fatalIfErr(err, "failed to save certificate and key")
 		}
 	} else {
 		domainCert, _ := x509.ParseCertificate(cert)
 		pfxData, err := pkcs12.Encode(rand.Reader, priv, domainCert, []*x509.Certificate{m.caCert}, "changeit")
 		fatalIfErr(err, "failed to generate PKCS#12")
-		err = ioutil.WriteFile(p12File, pfxData, 0644)
+		err = writeAllAtomic([]atomicWrite{{p12File, pfxData, 0600, true, false}})
 		fatalIfErr(err, "failed to save PKCS#12")
 	}
 
 	m.printHosts(hosts)
 
 	if !m.pkcs12 {
-		if certFile == keyFile {
+		if samePath(certFile, keyFile) {
 			log.Printf("\nThe certificate and key are at \"%s\" ✅\n\n", certFile)
 		} else {
 			log.Printf("\nThe certificate is at \"%s\" and the key at \"%s\" ✅\n\n", certFile, keyFile)
@@ -199,6 +220,17 @@ func (m *mkcert) fileNames(hosts []string) (certFile, keyFile, p12File string) {
 	return
 }
 
+func (m *mkcert) checkOutputPath(path, kind string) {
+	for _, caPath := range []string{
+		filepath.Join(m.CAROOT, rootName),
+		filepath.Join(m.CAROOT, rootKeyName),
+	} {
+		if samePath(path, caPath) {
+			log.Fatalf("ERROR: refusing to overwrite the CA %s at %q with output path %q", kind, caPath, path)
+		}
+	}
+}
+
 func randomSerialNumber() *big.Int {
 	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
 	serialNumber, err := rand.Int(rand.Reader, serialNumberLimit)
@@ -209,6 +241,13 @@ func randomSerialNumber() *big.Int {
 func (m *mkcert) makeCertFromCSR() {
 	if m.caKey == nil {
 		log.Fatalln("ERROR: can't create new certificates because the CA key (rootCA-key.pem) is missing")
+	}
+	if m.caCert == nil {
+		log.Fatalln("ERROR: can't create new certificates because the CA certificate is missing")
+	}
+	fatalIfErr(checkCAKeyPair(m.caCert, m.caKey), "the CA certificate and key do not match")
+	if m.CAROOT != "" {
+		fatalIfErr(secureMkdirAll(m.CAROOT), "failed to create the CAROOT")
 	}
 
 	csrPEMBytes, err := ioutil.ReadFile(m.csrPath)
@@ -266,9 +305,10 @@ func (m *mkcert) makeCertFromCSR() {
 		hosts = append(hosts, uri.String())
 	}
 	certFile, _, _ := m.fileNames(hosts)
+	m.checkOutputPath(certFile, "certificate")
 
-	err = ioutil.WriteFile(certFile, pem.EncodeToMemory(
-		&pem.Block{Type: "CERTIFICATE", Bytes: cert}), 0644)
+	err = writeAllAtomic([]atomicWrite{{certFile, pem.EncodeToMemory(
+		&pem.Block{Type: "CERTIFICATE", Bytes: cert}), 0644, false, false}})
 	fatalIfErr(err, "failed to save certificate")
 
 	m.printHosts(hosts)
@@ -280,12 +320,21 @@ func (m *mkcert) makeCertFromCSR() {
 
 // loadCA will load or create the CA at CAROOT.
 func (m *mkcert) loadCA() {
-	if !pathExists(filepath.Join(m.CAROOT, rootName)) {
+	fatalIfErr(secureMkdirAll(m.CAROOT), "failed to create the CAROOT")
+
+	certPath := filepath.Join(m.CAROOT, rootName)
+	certPEMBlock, certExists, err := readFileNoFollow(certPath, func(fi os.FileInfo) error {
+		return validateSensitiveFile(certPath, fi, false)
+	})
+	fatalIfErr(err, "failed to read the CA certificate")
+	if !certExists {
 		m.newCA()
+		return
+	}
+	if containsPrivateKeyPEM(certPEMBlock) {
+		log.Fatalf("ERROR: the CA certificate file %q contains a private key", certPath)
 	}
 
-	certPEMBlock, err := ioutil.ReadFile(filepath.Join(m.CAROOT, rootName))
-	fatalIfErr(err, "failed to read the CA certificate")
 	certDERBlock, _ := pem.Decode(certPEMBlock)
 	if certDERBlock == nil || certDERBlock.Type != "CERTIFICATE" {
 		log.Fatalln("ERROR: failed to read the CA certificate: unexpected content")
@@ -293,23 +342,84 @@ func (m *mkcert) loadCA() {
 	m.caCert, err = x509.ParseCertificate(certDERBlock.Bytes)
 	fatalIfErr(err, "failed to parse the CA certificate")
 
-	if !pathExists(filepath.Join(m.CAROOT, rootKeyName)) {
+	keyPath := filepath.Join(m.CAROOT, rootKeyName)
+	keyPEMBlock, keyExists, err := readFileNoFollow(keyPath, func(fi os.FileInfo) error {
+		return validateSensitiveFile(keyPath, fi, true)
+	})
+	fatalIfErr(err, "failed to read the CA key")
+	if !keyExists {
 		return // keyless mode, where only -install works
 	}
 
-	keyPEMBlock, err := ioutil.ReadFile(filepath.Join(m.CAROOT, rootKeyName))
-	fatalIfErr(err, "failed to read the CA key")
 	keyDERBlock, _ := pem.Decode(keyPEMBlock)
 	if keyDERBlock == nil || keyDERBlock.Type != "PRIVATE KEY" {
 		log.Fatalln("ERROR: failed to read the CA key: unexpected content")
 	}
 	m.caKey, err = x509.ParsePKCS8PrivateKey(keyDERBlock.Bytes)
 	fatalIfErr(err, "failed to parse the CA key")
+
+	if err := checkCAKeyPair(m.caCert, m.caKey); err != nil {
+		log.Fatalf("ERROR: CA certificate %q and key %q are not a matching pair: %s", certPath, keyPath, err)
+	}
+}
+
+func checkCAKeyPair(cert *x509.Certificate, key crypto.PrivateKey) error {
+	if !cert.IsCA && cert.KeyUsage&x509.KeyUsageCertSign == 0 {
+		return errors.New("certificate is not a CA certificate")
+	}
+	signer, ok := key.(crypto.Signer)
+	if !ok {
+		return errors.New("the CA key does not implement crypto.Signer")
+	}
+	certPub, err := x509.MarshalPKIXPublicKey(cert.PublicKey)
+	if err != nil {
+		return fmt.Errorf("failed to encode the CA certificate public key: %v", err)
+	}
+	keyPub, err := x509.MarshalPKIXPublicKey(signer.Public())
+	if err != nil {
+		return fmt.Errorf("failed to encode the CA key public key: %v", err)
+	}
+	if !bytes.Equal(certPub, keyPub) {
+		return errors.New("public key mismatch")
+	}
+	return nil
+}
+
+func containsPrivateKeyPEM(data []byte) bool {
+	for len(data) > 0 {
+		block, rest := pem.Decode(data)
+		if block == nil {
+			return false
+		}
+		if strings.Contains(block.Type, "PRIVATE KEY") {
+			return true
+		}
+		data = rest
+	}
+	return false
 }
 
 func (m *mkcert) newCA() {
+	fatalIfErr(secureMkdirAll(m.CAROOT), "failed to create the CAROOT")
+
+	keyPath := filepath.Join(m.CAROOT, rootKeyName)
+	certPath := filepath.Join(m.CAROOT, rootName)
+
+	if err := validateExistingOutput(keyPath, true); err != nil {
+		fatalIfErr(err, "failed to read the CA key")
+	}
+	keyExists := false
+	if _, err := os.Lstat(keyPath); err == nil {
+		keyExists = true
+	} else if !os.IsNotExist(err) {
+		fatalIfErr(err, "failed to read the CA key")
+	}
+
 	priv, err := m.generateKey(true)
 	fatalIfErr(err, "failed to generate the CA key")
+	if _, ok := priv.(crypto.Signer); !ok {
+		log.Fatalln("ERROR: failed to read the CA key: unsupported key type")
+	}
 	pub := priv.(crypto.Signer).Public()
 
 	spkiASN1, err := x509.MarshalPKIXPublicKey(pub)
@@ -352,13 +462,18 @@ func (m *mkcert) newCA() {
 
 	privDER, err := x509.MarshalPKCS8PrivateKey(priv)
 	fatalIfErr(err, "failed to encode CA key")
-	err = ioutil.WriteFile(filepath.Join(m.CAROOT, rootKeyName), pem.EncodeToMemory(
-		&pem.Block{Type: "PRIVATE KEY", Bytes: privDER}), 0400)
-	fatalIfErr(err, "failed to save CA key")
+	createOnly := !keyExists
+	err = writeAllAtomic([]atomicWrite{
+		{keyPath, pem.EncodeToMemory(
+			&pem.Block{Type: "PRIVATE KEY", Bytes: privDER}), 0400, true, createOnly},
+		{certPath, pem.EncodeToMemory(
+			&pem.Block{Type: "CERTIFICATE", Bytes: cert}), 0644, false, createOnly},
+	})
+	fatalIfErr(err, "failed to save CA key and certificate")
 
-	err = ioutil.WriteFile(filepath.Join(m.CAROOT, rootName), pem.EncodeToMemory(
-		&pem.Block{Type: "CERTIFICATE", Bytes: cert}), 0644)
-	fatalIfErr(err, "failed to save CA certificate")
+	m.caCert, err = x509.ParseCertificate(cert)
+	fatalIfErr(err, "failed to parse the generated CA certificate")
+	m.caKey = priv
 
 	log.Printf("Created a new local CA 💥\n")
 }

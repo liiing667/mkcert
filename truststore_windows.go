@@ -6,12 +6,9 @@ package main
 
 import (
 	"crypto/x509"
-	"encoding/pem"
 	"fmt"
-	"io/ioutil"
 	"math/big"
 	"os"
-	"path/filepath"
 	"syscall"
 	"unsafe"
 )
@@ -33,21 +30,15 @@ var (
 )
 
 func (m *mkcert) installPlatform() bool {
-	// Load cert
-	cert, err := ioutil.ReadFile(filepath.Join(m.CAROOT, rootName))
-	fatalIfErr(err, "failed to read root certificate")
-	// Decode PEM
-	if certBlock, _ := pem.Decode(cert); certBlock == nil || certBlock.Type != "CERTIFICATE" {
-		fatalIfErr(fmt.Errorf("invalid PEM data"), "decode pem")
-	} else {
-		cert = certBlock.Bytes
-	}
+	// Use the certificate that was loaded for this invocation, not a path
+	// that could have been replaced by a symlink or another process.
+	m.caCertPEM()
 	// Open root store
 	store, err := openWindowsRootStore()
 	fatalIfErr(err, "open root store")
 	defer store.close()
 	// Add cert
-	fatalIfErr(store.addCert(cert), "add cert")
+	fatalIfErr(store.addCert(m.caCert.Raw), "add cert")
 	return true
 }
 
