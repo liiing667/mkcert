@@ -207,10 +207,62 @@ func randomSerialNumber() *big.Int {
 }
 
 func (m *mkcert) makeCertFromCSR() {
+	if m.csr == nil || m.csrRequest == nil || m.csrSource != m.csrPath {
+		m.prepareCSRIssuance()
+	}
+	csr := m.csr
+	request := m.csrRequest
+	m.csr = nil
+	m.csrRequest = nil
+	m.csrSource = ""
+
+	if m.caCert == nil {
+		log.Fatalln("ERROR: can't create new certificates because the CA certificate (rootCA.pem) is missing")
+	}
+	now := time.Now()
+	if err := validateCACertificateForIssuance(m.caCert, now); err != nil {
+		log.Fatalf("ERROR: refusing to issue certificate: %v", err)
+	}
+	profile, err := m.authorizeCSRIssuance(request)
+	fatalIfErr(err, "failed to authorize the CSR")
 	if m.caKey == nil {
 		log.Fatalln("ERROR: can't create new certificates because the CA key (rootCA-key.pem) is missing")
 	}
+	if err := validateCAKeyForIssuance(m.caCert, m.caKey); err != nil {
+		log.Fatalf("ERROR: refusing to issue certificate: %v", err)
+	}
 
+	cert, err := x509.CreateCertificate(rand.Reader, profile.certificateTemplate(), m.caCert, csr.PublicKey, m.caKey)
+	fatalIfErr(err, "failed to generate certificate")
+	c, err := verifyIssuedLeaf(cert, profile, m.caCert)
+	fatalIfErr(err, "failed to verify generated certificate")
+
+	var hosts []string
+	hosts = append(hosts, c.DNSNames...)
+	hosts = append(hosts, c.EmailAddresses...)
+	for _, ip := range c.IPAddresses {
+		hosts = append(hosts, ip.String())
+	}
+	for _, uri := range c.URIs {
+		hosts = append(hosts, uri.String())
+	}
+	if len(hosts) == 0 {
+		log.Fatalln("ERROR: generated certificate contains no subject alternative names")
+	}
+	certFile, _, _ := m.fileNames(hosts)
+
+	err = writeFileAtomic(certFile, pem.EncodeToMemory(
+		&pem.Block{Type: "CERTIFICATE", Bytes: cert}), 0644)
+	fatalIfErr(err, "failed to save certificate")
+
+	m.printHosts(hosts)
+
+	log.Printf("\nThe certificate is at \"%s\" ✅\n\n", certFile)
+
+	log.Printf("It will expire on %s 🗓\n\n", profile.notAfter.Format("2 January 2006"))
+}
+
+func (m *mkcert) readAndVerifyCSR() *x509.CertificateRequest {
 	csrPEMBytes, err := ioutil.ReadFile(m.csrPath)
 	fatalIfErr(err, "failed to read the CSR")
 	csrPEM, _ := pem.Decode(csrPEMBytes)
@@ -224,62 +276,38 @@ func (m *mkcert) makeCertFromCSR() {
 	csr, err := x509.ParseCertificateRequest(csrPEM.Bytes)
 	fatalIfErr(err, "failed to parse the CSR")
 	fatalIfErr(csr.CheckSignature(), "invalid CSR signature")
+	return csr
+}
 
-	expiration := time.Now().AddDate(2, 3, 0)
-	tpl := &x509.Certificate{
-		SerialNumber:    randomSerialNumber(),
-		Subject:         csr.Subject,
-		ExtraExtensions: csr.Extensions, // includes requested SANs, KUs and EKUs
-
-		NotBefore: time.Now(), NotAfter: expiration,
-
-		// If the CSR does not request a SAN extension, fix it up for them as
-		// the Common Name field does not work in modern browsers. Otherwise,
-		// this will get overridden.
-		DNSNames: []string{csr.Subject.CommonName},
-
-		// Likewise, if the CSR does not set KUs and EKUs, fix it up as Apple
-		// platforms require serverAuth for TLS.
-		KeyUsage:    x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
-		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	f, err := ioutil.TempFile(dir, "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
 	}
+	tmpName := f.Name()
+	defer os.Remove(tmpName)
 
-	if m.client {
-		tpl.ExtKeyUsage = append(tpl.ExtKeyUsage, x509.ExtKeyUsageClientAuth)
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
 	}
-	if len(csr.EmailAddresses) > 0 {
-		tpl.ExtKeyUsage = append(tpl.ExtKeyUsage, x509.ExtKeyUsageEmailProtection)
+	if err := f.Chmod(perm); err != nil {
+		f.Close()
+		return err
 	}
-
-	cert, err := x509.CreateCertificate(rand.Reader, tpl, m.caCert, csr.PublicKey, m.caKey)
-	fatalIfErr(err, "failed to generate certificate")
-	c, err := x509.ParseCertificate(cert)
-	fatalIfErr(err, "failed to parse generated certificate")
-
-	var hosts []string
-	hosts = append(hosts, c.DNSNames...)
-	hosts = append(hosts, c.EmailAddresses...)
-	for _, ip := range c.IPAddresses {
-		hosts = append(hosts, ip.String())
+	if err := f.Close(); err != nil {
+		return err
 	}
-	for _, uri := range c.URIs {
-		hosts = append(hosts, uri.String())
-	}
-	certFile, _, _ := m.fileNames(hosts)
-
-	err = ioutil.WriteFile(certFile, pem.EncodeToMemory(
-		&pem.Block{Type: "CERTIFICATE", Bytes: cert}), 0644)
-	fatalIfErr(err, "failed to save certificate")
-
-	m.printHosts(hosts)
-
-	log.Printf("\nThe certificate is at \"%s\" ✅\n\n", certFile)
-
-	log.Printf("It will expire on %s 🗓\n\n", expiration.Format("2 January 2006"))
+	return os.Rename(tmpName, path)
 }
 
 // loadCA will load or create the CA at CAROOT.
 func (m *mkcert) loadCA() {
+	if m.csrPath != "" && !m.uninstallMode &&
+		(m.csrRequest == nil || m.csrSource != m.csrPath) {
+		m.prepareCSRIssuance()
+	}
 	if !pathExists(filepath.Join(m.CAROOT, rootName)) {
 		m.newCA()
 	}
@@ -292,6 +320,19 @@ func (m *mkcert) loadCA() {
 	}
 	m.caCert, err = x509.ParseCertificate(certDERBlock.Bytes)
 	fatalIfErr(err, "failed to parse the CA certificate")
+
+	if m.csrPath != "" && !m.uninstallMode {
+		// The same CA constraints used by the issuance profile are checked
+		// before the CA private key is read.
+		if err := validateCACertificateForIssuance(m.caCert, time.Now()); err != nil {
+			log.Fatalf("ERROR: refusing to use CA for CSR issuance: %v", err)
+		}
+		if m.csrRequest != nil && m.csrSource == m.csrPath {
+			if _, err := m.authorizeCSRIssuance(m.csrRequest); err != nil {
+				log.Fatalf("ERROR: refusing to use CA for CSR issuance: %v", err)
+			}
+		}
+	}
 
 	if !pathExists(filepath.Join(m.CAROOT, rootKeyName)) {
 		return // keyless mode, where only -install works

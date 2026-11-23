@@ -166,6 +166,10 @@ type mkcert struct {
 	// will keep failing until the next execution. TODO: maybe execve?
 	// https://github.com/golang/go/issues/24540 (thanks, myself)
 	ignoreCheckFailure bool
+
+	csr        *x509.CertificateRequest
+	csrRequest *csrRequestProfile
+	csrSource  string
 }
 
 func (m *mkcert) Run(args []string) {
@@ -173,12 +177,18 @@ func (m *mkcert) Run(args []string) {
 	if m.CAROOT == "" {
 		log.Fatalln("ERROR: failed to find the default CA location, set one as the CAROOT env var")
 	}
+	if m.csrPath != "" && !m.uninstallMode {
+		// Classify and authorize the CSR before loadCA reads or creates any
+		// CA key material. A rejected CSR must not leave a completed CA or
+		// certificate generation behind.
+		m.prepareCSRIssuance()
+	}
 	fatalIfErr(os.MkdirAll(m.CAROOT, 0755), "failed to create the CAROOT")
 	m.loadCA()
 
 	if m.installMode {
 		m.install()
-		if len(args) == 0 {
+		if len(args) == 0 && m.csrPath == "" {
 			return
 		}
 	} else if m.uninstallMode {
