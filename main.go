@@ -54,6 +54,9 @@ const advancedUsage = `Advanced options:
 	-client
 	    Generate a certificate for client authentication.
 
+	-server
+	    Generate a certificate for server authentication.
+
 	-ecdsa
 	    Generate a certificate with an ECDSA key.
 
@@ -63,7 +66,8 @@ const advancedUsage = `Advanced options:
 
 	-csr CSR
 	    Generate a certificate based on the supplied CSR. Conflicts with
-	    all other flags and arguments except -install and -cert-file.
+	    -pkcs12 and arguments, but can be combined with -client, -server,
+	    -ecdsa, -install and -cert-file.
 
 	-CAROOT
 	    Print the CA certificate and key storage location.
@@ -96,6 +100,7 @@ func main() {
 		pkcs12Flag    = flag.Bool("pkcs12", false, "")
 		ecdsaFlag     = flag.Bool("ecdsa", false, "")
 		clientFlag    = flag.Bool("client", false, "")
+		serverFlag    = flag.Bool("server", false, "")
 		helpFlag      = flag.Bool("help", false, "")
 		carootFlag    = flag.Bool("CAROOT", false, "")
 		csrFlag       = flag.String("csr", "", "")
@@ -136,15 +141,15 @@ func main() {
 	if *installFlag && *uninstallFlag {
 		log.Fatalln("ERROR: you can't set -install and -uninstall at the same time")
 	}
-	if *csrFlag != "" && (*pkcs12Flag || *ecdsaFlag || *clientFlag) {
-		log.Fatalln("ERROR: can only combine -csr with -install and -cert-file")
+	if *csrFlag != "" && *pkcs12Flag {
+		log.Fatalln("ERROR: can only combine -csr with -install, -cert-file, -client, -server and -ecdsa")
 	}
 	if *csrFlag != "" && flag.NArg() != 0 {
 		log.Fatalln("ERROR: can't specify extra arguments when using -csr")
 	}
 	(&mkcert{
 		installMode: *installFlag, uninstallMode: *uninstallFlag, csrPath: *csrFlag,
-		pkcs12: *pkcs12Flag, ecdsa: *ecdsaFlag, client: *clientFlag,
+		pkcs12: *pkcs12Flag, ecdsa: *ecdsaFlag, client: *clientFlag, server: *serverFlag,
 		certFile: *certFileFlag, keyFile: *keyFileFlag, p12File: *p12FileFlag,
 	}).Run(flag.Args())
 }
@@ -153,10 +158,10 @@ const rootName = "rootCA.pem"
 const rootKeyName = "rootCA-key.pem"
 
 type mkcert struct {
-	installMode, uninstallMode bool
-	pkcs12, ecdsa, client      bool
-	keyFile, certFile, p12File string
-	csrPath                    string
+	installMode, uninstallMode    bool
+	pkcs12, ecdsa, client, server bool
+	keyFile, certFile, p12File    string
+	csrPath                       string
 
 	CAROOT string
 	caCert *x509.Certificate
@@ -178,7 +183,7 @@ func (m *mkcert) Run(args []string) {
 
 	if m.installMode {
 		m.install()
-		if len(args) == 0 {
+		if len(args) == 0 && m.csrPath == "" {
 			return
 		}
 	} else if m.uninstallMode {

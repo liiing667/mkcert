@@ -135,6 +135,9 @@ To only install the local root CA into a subset of them, you can set the `TRUST_
 	-client
 	    Generate a certificate for client authentication.
 
+	-server
+	    Generate a certificate for server authentication.
+
 	-ecdsa
 	    Generate a certificate with an ECDSA key.
 
@@ -144,7 +147,8 @@ To only install the local root CA into a subset of them, you can set the `TRUST_
 
 	-csr CSR
 	    Generate a certificate based on the supplied CSR. Conflicts with
-	    all other flags and arguments except -install and -cert-file.
+	    -pkcs12 and arguments, but can be combined with -client, -server,
+	    -ecdsa, -install and -cert-file.
 ```
 
 > **Note:** You _must_ place these options before the domain names list.

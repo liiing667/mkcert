@@ -69,8 +69,6 @@ func (m *mkcert) makeCert(hosts []string) {
 		},
 
 		NotBefore: time.Now(), NotAfter: expiration,
-
-		KeyUsage: x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
 	}
 
 	for _, h := range hosts {
@@ -85,15 +83,9 @@ func (m *mkcert) makeCert(hosts []string) {
 		}
 	}
 
-	if m.client {
-		tpl.ExtKeyUsage = append(tpl.ExtKeyUsage, x509.ExtKeyUsageClientAuth)
-	}
-	if len(tpl.IPAddresses) > 0 || len(tpl.DNSNames) > 0 || len(tpl.URIs) > 0 {
-		tpl.ExtKeyUsage = append(tpl.ExtKeyUsage, x509.ExtKeyUsageServerAuth)
-	}
-	if len(tpl.EmailAddresses) > 0 {
-		tpl.ExtKeyUsage = append(tpl.ExtKeyUsage, x509.ExtKeyUsageEmailProtection)
-	}
+	purpose := m.purposeForCertificate(tpl)
+	tpl.KeyUsage = purpose.keyUsage()
+	tpl.ExtKeyUsage = purpose.extKeyUsage()
 
 	// IIS (the main target of PKCS #12 files), only shows the deprecated
 	// Common Name in the UI. See issue #115.
@@ -104,7 +96,7 @@ func (m *mkcert) makeCert(hosts []string) {
 	cert, err := x509.CreateCertificate(rand.Reader, tpl, m.caCert, pub, m.caKey)
 	fatalIfErr(err, "failed to generate certificate")
 
-	certFile, keyFile, p12File := m.fileNames(hosts)
+	certFile, keyFile, p12File := m.fileNames(hosts, purpose)
 
 	if !m.pkcs12 {
 		certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert})
@@ -173,15 +165,28 @@ func (m *mkcert) generateKey(rootCA bool) (crypto.PrivateKey, error) {
 	return rsa.GenerateKey(rand.Reader, 2048)
 }
 
-func (m *mkcert) fileNames(hosts []string) (certFile, keyFile, p12File string) {
+func (m *mkcert) fileNames(hosts []string, purposes ...certPurpose) (certFile, keyFile, p12File string) {
+	purpose := purposeServer
+	if m.client {
+		purpose = purposeClient
+	}
+	if len(purposes) > 0 {
+		purpose = 0
+		for _, p := range purposes {
+			purpose |= p
+		}
+	}
+
 	defaultName := strings.Replace(hosts[0], ":", "_", -1)
 	defaultName = strings.Replace(defaultName, "*", "_wildcard", -1)
+	// URI SANs can contain path separators; keep the default output name a
+	// single file in the current directory.
+	defaultName = strings.Replace(defaultName, "/", "_", -1)
+	defaultName = strings.Replace(defaultName, "\\", "_", -1)
 	if len(hosts) > 1 {
 		defaultName += "+" + strconv.Itoa(len(hosts)-1)
 	}
-	if m.client {
-		defaultName += "-client"
-	}
+	defaultName += purpose.clientSuffix()
 
 	certFile = "./" + defaultName + ".pem"
 	if m.certFile != "" {
@@ -225,30 +230,32 @@ func (m *mkcert) makeCertFromCSR() {
 	fatalIfErr(err, "failed to parse the CSR")
 	fatalIfErr(csr.CheckSignature(), "invalid CSR signature")
 
+	purpose, err := m.purposeForCSR(csr)
+	if err != nil {
+		log.Fatalf("ERROR: %s", err)
+	}
+
 	expiration := time.Now().AddDate(2, 3, 0)
 	tpl := &x509.Certificate{
-		SerialNumber:    randomSerialNumber(),
-		Subject:         csr.Subject,
-		ExtraExtensions: csr.Extensions, // includes requested SANs, KUs and EKUs
+		SerialNumber: randomSerialNumber(),
+		Subject:      csr.Subject,
 
 		NotBefore: time.Now(), NotAfter: expiration,
 
+		KeyUsage:    purpose.keyUsage(),
+		ExtKeyUsage: purpose.extKeyUsage(),
+	}
+
+	// Only the SAN extension is taken from the CSR. KeyUsage, EKU,
+	// BasicConstraints and everything else are derived from the resolved
+	// purpose above, so a CSR cannot grant itself serverAuth, CA privileges,
+	// or any other unrequested capability.
+	if san, ok := findSANExtension(csr.Extensions); ok {
+		tpl.ExtraExtensions = []pkix.Extension{san}
+	} else if csr.Subject.CommonName != "" {
 		// If the CSR does not request a SAN extension, fix it up for them as
-		// the Common Name field does not work in modern browsers. Otherwise,
-		// this will get overridden.
-		DNSNames: []string{csr.Subject.CommonName},
-
-		// Likewise, if the CSR does not set KUs and EKUs, fix it up as Apple
-		// platforms require serverAuth for TLS.
-		KeyUsage:    x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
-		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-	}
-
-	if m.client {
-		tpl.ExtKeyUsage = append(tpl.ExtKeyUsage, x509.ExtKeyUsageClientAuth)
-	}
-	if len(csr.EmailAddresses) > 0 {
-		tpl.ExtKeyUsage = append(tpl.ExtKeyUsage, x509.ExtKeyUsageEmailProtection)
+		// the Common Name field does not work in modern browsers.
+		tpl.DNSNames = []string{csr.Subject.CommonName}
 	}
 
 	cert, err := x509.CreateCertificate(rand.Reader, tpl, m.caCert, csr.PublicKey, m.caKey)
@@ -265,7 +272,10 @@ func (m *mkcert) makeCertFromCSR() {
 	for _, uri := range c.URIs {
 		hosts = append(hosts, uri.String())
 	}
-	certFile, _, _ := m.fileNames(hosts)
+	if len(hosts) == 0 {
+		log.Fatalln("ERROR: the CSR does not contain any subject alternative names or a common name")
+	}
+	certFile, _, _ := m.fileNames(hosts, purpose)
 
 	err = ioutil.WriteFile(certFile, pem.EncodeToMemory(
 		&pem.Block{Type: "CERTIFICATE", Bytes: cert}), 0644)
