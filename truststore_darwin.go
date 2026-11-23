@@ -7,10 +7,13 @@ package main
 import (
 	"bytes"
 	"encoding/asn1"
+	"encoding/pem"
+	"fmt"
 	"io/ioutil"
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"howett.net/plist"
 )
@@ -103,9 +106,69 @@ func (m *mkcert) installPlatform() bool {
 }
 
 func (m *mkcert) uninstallPlatform() bool {
-	cmd := commandWithSudo("security", "remove-trusted-cert", "-d", filepath.Join(m.CAROOT, rootName))
-	out, err := cmd.CombinedOutput()
-	fatalIfCmdErr(err, "security remove-trusted-cert", out)
+	result := m.removeFromPlatform()
+	if result.failed() {
+		log.Fatalf("ERROR: failed to uninstall the local CA from the system trust store: %s", result.Detail)
+	}
+	return result.Status == resultRemoved || result.Status == resultAbsent
+}
 
-	return true
+func (m *mkcert) removeFromPlatform() storeRemovalResult {
+	result := storeRemovalResult{Store: storeSystem}
+	if m.caCert == nil {
+		result.Status = resultFailed
+		result.Stage = "load CA identity"
+		result.Detail = "the local CA certificate is not loaded"
+		return result
+	}
+	// security(1) removes the certificate found in the supplied file. Pin the
+	// transaction to a private snapshot so a concurrent CAROOT rotation cannot
+	// make it remove a different CA.
+	temp, err := ioutil.TempFile("", "mkcert-uninstall-*.pem")
+	if err != nil {
+		result.Status = resultFailed
+		result.Stage = "create CA snapshot"
+		result.Detail = err.Error()
+		return result
+	}
+	tempName := temp.Name()
+	defer os.Remove(tempName)
+	if err := temp.Chmod(0600); err != nil {
+		temp.Close()
+		result.Status = resultFailed
+		result.Stage = "create CA snapshot"
+		result.Detail = err.Error()
+		return result
+	}
+	if err := pem.Encode(temp, &pem.Block{Type: "CERTIFICATE", Bytes: m.caCert.Raw}); err != nil {
+		temp.Close()
+		result.Status = resultFailed
+		result.Stage = "create CA snapshot"
+		result.Detail = err.Error()
+		return result
+	}
+	if err := temp.Close(); err != nil {
+		result.Status = resultFailed
+		result.Stage = "create CA snapshot"
+		result.Detail = err.Error()
+		return result
+	}
+
+	cmd := commandWithSudo("security", "remove-trusted-cert", "-d", tempName)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		text := strings.ToLower(string(out))
+		if strings.Contains(text, "could not be found") || strings.Contains(text, "not found") {
+			result.Status = resultAbsent
+			result.Stage = "security remove-trusted-cert"
+			return result
+		}
+		result.Status = resultFailed
+		result.Stage = "security remove-trusted-cert"
+		result.Detail = fmt.Sprintf("%v: %s", err, strings.TrimSpace(string(out)))
+		return result
+	}
+	result.Status = resultRemoved
+	result.Stage = "security remove-trusted-cert"
+	return result
 }

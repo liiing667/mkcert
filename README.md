@@ -185,6 +185,8 @@ The CA certificate and its key are stored in an application data folder in the u
 
 If you want to manage separate CAs, you can use the environment variable `$CAROOT` to set the folder where mkcert will place and look for the local CA files.
 
+`mkcert -uninstall` removes the local CA from the enabled trust stores and deletes its certificate and key only after every selected store has been cleaned up. If a store is unavailable or a removal fails, the CA files are kept and the command can be re-run to finish the same revocation.
+
 ### Installing the CA on other systems
 
 Installing in the trust store does not require the CA key, so you can export the CA certificate and use mkcert to install it in other machines.

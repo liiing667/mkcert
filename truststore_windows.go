@@ -5,6 +5,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
@@ -52,18 +53,47 @@ func (m *mkcert) installPlatform() bool {
 }
 
 func (m *mkcert) uninstallPlatform() bool {
+	result := m.removeFromPlatform()
+	if result.failed() {
+		fatalIfErr(fmt.Errorf("%s", result.Detail), "delete cert")
+	}
+	return result.Status == resultRemoved || result.Status == resultAbsent
+}
+
+func (m *mkcert) removeFromPlatform() storeRemovalResult {
+	result := storeRemovalResult{Store: storeSystem}
+	if m.caCert == nil {
+		result.Status = resultFailed
+		result.Stage = "load CA identity"
+		result.Detail = "the local CA certificate is not loaded"
+		return result
+	}
 	// We'll just remove all certs with the same serial number
 	// Open root store
 	store, err := openWindowsRootStore()
-	fatalIfErr(err, "open root store")
+	if err != nil {
+		result.Status = resultFailed
+		result.Stage = "open root store"
+		result.Detail = err.Error()
+		return result
+	}
 	defer store.close()
 	// Do the deletion
-	deletedAny, err := store.deleteCertsWithSerial(m.caCert.SerialNumber)
-	if err == nil && !deletedAny {
-		err = fmt.Errorf("no certs found")
+	deletedAny, err := store.deleteCertsMatching(m.caCert.SerialNumber, m.caCert.Raw)
+	if err != nil {
+		result.Status = resultFailed
+		result.Stage = "delete cert"
+		result.Detail = err.Error()
+		return result
 	}
-	fatalIfErr(err, "delete cert")
-	return true
+	if !deletedAny {
+		result.Status = resultAbsent
+		result.Stage = "delete cert"
+		return result
+	}
+	result.Status = resultRemoved
+	result.Stage = "delete cert"
+	return result
 }
 
 type windowsRootStore uintptr
@@ -105,6 +135,10 @@ func (w windowsRootStore) addCert(cert []byte) error {
 }
 
 func (w windowsRootStore) deleteCertsWithSerial(serial *big.Int) (bool, error) {
+	return w.deleteCertsMatching(serial, nil)
+}
+
+func (w windowsRootStore) deleteCertsMatching(serial *big.Int, raw []byte) (bool, error) {
 	// Go over each, deleting the ones we find
 	var cert *syscall.CertContext
 	deletedAny := false
@@ -121,7 +155,8 @@ func (w windowsRootStore) deleteCertsWithSerial(serial *big.Int) (bool, error) {
 		certBytes := (*[1 << 20]byte)(unsafe.Pointer(cert.EncodedCert))[:cert.Length]
 		parsedCert, err := x509.ParseCertificate(certBytes)
 		// We'll just ignore parse failures for now
-		if err == nil && parsedCert.SerialNumber != nil && parsedCert.SerialNumber.Cmp(serial) == 0 {
+		if err == nil && parsedCert.SerialNumber != nil && parsedCert.SerialNumber.Cmp(serial) == 0 &&
+			(raw == nil || bytes.Equal(parsedCert.Raw, raw)) {
 			// Duplicate the context so it doesn't stop the enum when we delete it
 			dupCertPtr, _, err := procCertDuplicateCertificateContext.Call(uintptr(unsafe.Pointer(cert)))
 			if dupCertPtr == 0 {

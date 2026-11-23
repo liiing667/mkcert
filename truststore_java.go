@@ -10,7 +10,9 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/hex"
+	"fmt"
 	"hash"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -92,6 +94,27 @@ func (m *mkcert) installJava() {
 }
 
 func (m *mkcert) uninstallJava() {
+	result := m.removeFromJava()
+	if result.failed() {
+		log.Fatalf("ERROR: failed to uninstall the local CA from Java's trust store: %s", result.Detail)
+	}
+}
+
+func (m *mkcert) removeFromJava() storeRemovalResult {
+	result := storeRemovalResult{Store: storeJava}
+	if m.caCert == nil {
+		result.Status = resultFailed
+		result.Stage = "load CA identity"
+		result.Detail = "the local CA certificate is not loaded"
+		return result
+	}
+	if !hasKeytool || keytoolPath == "" {
+		result.Status = resultUnavailable
+		result.Stage = "find keytool"
+		result.Detail = `"keytool" is not available`
+		return result
+	}
+
 	args := []string{
 		"-delete",
 		"-alias", m.caUniqueName(),
@@ -99,10 +122,20 @@ func (m *mkcert) uninstallJava() {
 		"-storepass", storePass,
 	}
 	out, err := execKeytool(exec.Command(keytoolPath, args...))
-	if bytes.Contains(out, []byte("does not exist")) {
-		return // cert didn't exist
+	if bytes.Contains(bytes.ToLower(out), []byte("does not exist")) {
+		result.Status = resultAbsent
+		result.Stage = "keytool -delete"
+		return result
 	}
-	fatalIfCmdErr(err, "keytool -delete", out)
+	if err != nil {
+		result.Status = resultFailed
+		result.Stage = "keytool -delete"
+		result.Detail = fmt.Sprintf("%v: %s", err, strings.TrimSpace(string(out)))
+		return result
+	}
+	result.Status = resultRemoved
+	result.Stage = "keytool -delete"
+	return result
 }
 
 // execKeytool will execute a "keytool" command and if needed re-execute

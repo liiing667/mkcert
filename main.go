@@ -42,7 +42,7 @@ const shortUsage = `Usage of mkcert:
 	Generate "_wildcard.example.it.pem" and "_wildcard.example.it-key.pem".
 
 	$ mkcert -uninstall
-	Uninstall the local CA (but do not delete it).
+	Uninstall and delete the local CA.
 
 `
 
@@ -173,6 +173,12 @@ func (m *mkcert) Run(args []string) {
 	if m.CAROOT == "" {
 		log.Fatalln("ERROR: failed to find the default CA location, set one as the CAROOT env var")
 	}
+	// Uninstall must never create or replace a CA when CAROOT is empty. It
+	// loads its own pinned snapshot (or resumes one from the journal) below.
+	if m.uninstallMode {
+		m.uninstall()
+		return
+	}
 	fatalIfErr(os.MkdirAll(m.CAROOT, 0755), "failed to create the CAROOT")
 	m.loadCA()
 
@@ -181,9 +187,6 @@ func (m *mkcert) Run(args []string) {
 		if len(args) == 0 {
 			return
 		}
-	} else if m.uninstallMode {
-		m.uninstall()
-		return
 	} else {
 		var warning bool
 		if storeEnabled("system") && !m.checkPlatform() {
@@ -302,35 +305,6 @@ func (m *mkcert) install() {
 		}
 	}
 	log.Print("")
-}
-
-func (m *mkcert) uninstall() {
-	if storeEnabled("nss") && hasNSS {
-		if hasCertutil {
-			m.uninstallNSS()
-		} else if CertutilInstallHelp != "" {
-			log.Print("")
-			log.Printf(`Warning: "certutil" is not available, so the CA can't be automatically uninstalled from %s (if it was ever installed)! ⚠️`, NSSBrowsers)
-			log.Printf(`You can install "certutil" with "%s" and re-run "mkcert -uninstall" 👈`, CertutilInstallHelp)
-			log.Print("")
-		}
-	}
-	if storeEnabled("java") && hasJava {
-		if hasKeytool {
-			m.uninstallJava()
-		} else {
-			log.Print("")
-			log.Println(`Warning: "keytool" is not available, so the CA can't be automatically uninstalled from Java's trust store (if it was ever installed)! ⚠️`)
-			log.Print("")
-		}
-	}
-	if storeEnabled("system") && m.uninstallPlatform() {
-		log.Print("The local CA is now uninstalled from the system trust store(s)! 👋")
-		log.Print("")
-	} else if storeEnabled("nss") && hasCertutil {
-		log.Printf("The local CA is now uninstalled from the %s trust store(s)! 👋", NSSBrowsers)
-		log.Print("")
-	}
 }
 
 func (m *mkcert) checkPlatform() bool {

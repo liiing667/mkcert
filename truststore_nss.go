@@ -6,6 +6,7 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"log"
 	"os"
 	"os/exec"
@@ -104,15 +105,93 @@ func (m *mkcert) installNSS() bool {
 }
 
 func (m *mkcert) uninstallNSS() {
+	result := m.removeFromNSS()
+	if result.failed() {
+		log.Fatalf("ERROR: failed to uninstall the local CA from the %s trust store: %s", NSSBrowsers, result.Detail)
+	}
+}
+
+func (m *mkcert) removeFromNSS() storeRemovalResult {
+	result := storeRemovalResult{Store: storeNSS}
+	if m.caCert == nil {
+		result.Status = resultFailed
+		result.Stage = "load CA identity"
+		result.Detail = "the local CA certificate is not loaded"
+		return result
+	}
+	if !hasCertutil {
+		result.Status = resultUnavailable
+		result.Stage = "find certutil"
+		result.Detail = `"certutil" is not available`
+		return result
+	}
+
+	profiles, removed := 0, 0
+	var failures []string
 	m.forEachNSSProfile(func(profile string) {
-		err := exec.Command(certutilPath, "-V", "-d", profile, "-u", "L", "-n", m.caUniqueName()).Run()
+		profiles++
+		out, err := exec.Command(certutilPath, "-V", "-d", profile, "-u", "L", "-n", m.caUniqueName()).CombinedOutput()
 		if err != nil {
-			return
+			// certutil -V reports an unknown alias as "could not find
+			// cert". Any other verification failure is not evidence that
+			// the entry is absent, so ask for the alias explicitly before
+			// deciding whether the store is already clean.
+			if certutilNotFound(out) {
+				return
+			}
+			listOut, listErr := exec.Command(certutilPath, "-L", "-d", profile, "-n", m.caUniqueName()).CombinedOutput()
+			if listErr != nil {
+				if certutilNotFound(listOut) {
+					return
+				}
+				detail := fmt.Sprintf("%v", listErr)
+				if text := strings.TrimSpace(string(listOut)); text != "" {
+					detail += ": " + text
+				}
+				failures = append(failures, fmt.Sprintf("certutil -L -d %s: %s", profile, detail))
+				return
+			}
 		}
 		cmd := exec.Command(certutilPath, "-D", "-d", profile, "-n", m.caUniqueName())
-		out, err := execCertutil(cmd)
-		fatalIfCmdErr(err, "certutil -D -d "+profile, out)
+		out, err = execCertutil(cmd)
+		if err != nil {
+			detail := fmt.Sprintf("%v", err)
+			if text := strings.TrimSpace(string(out)); text != "" {
+				detail += ": " + text
+			}
+			failures = append(failures, fmt.Sprintf("certutil -D -d %s: %s", profile, detail))
+			return
+		}
+		removed++
 	})
+
+	if len(failures) > 0 {
+		result.Status = resultFailed
+		result.Stage = "certutil -D"
+		result.Detail = strings.Join(failures, "; ")
+		return result
+	}
+	if removed > 0 {
+		result.Status = resultRemoved
+		result.Stage = "certutil -D"
+		return result
+	}
+	if profiles == 0 {
+		result.Stage = "no NSS security databases found"
+	} else {
+		result.Stage = "NSS trust entry already absent"
+	}
+	result.Status = resultAbsent
+	return result
+}
+
+func certutilNotFound(out []byte) bool {
+	text := strings.ToLower(string(out))
+	return strings.Contains(text, "could not find cert") ||
+		strings.Contains(text, "certificate not found") ||
+		strings.Contains(text, "not found") ||
+		strings.Contains(text, "no such") ||
+		strings.Contains(text, "does not exist")
 }
 
 // execCertutil will execute a "certutil" command and if needed re-execute

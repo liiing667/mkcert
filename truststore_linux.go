@@ -75,25 +75,96 @@ func (m *mkcert) installPlatform() bool {
 }
 
 func (m *mkcert) uninstallPlatform() bool {
-	if SystemTrustCommand == nil {
-		return false
+	result := m.removeFromPlatform()
+	if result.failed() {
+		log.Fatalf("ERROR: failed to uninstall the local CA from the system trust store: %s", result.Detail)
+	}
+	return result.Status == resultRemoved || result.Status == resultAbsent
+}
+
+func (m *mkcert) removeFromPlatform() storeRemovalResult {
+	result := storeRemovalResult{Store: storeSystem}
+	if m.caCert == nil {
+		result.Status = resultFailed
+		result.Stage = "load CA identity"
+		result.Detail = "the local CA certificate is not loaded"
+		return result
+	}
+	if SystemTrustCommand == nil || SystemTrustFilename == "" {
+		result.Status = resultUnavailable
+		result.Stage = "detect system trust store"
+		result.Detail = "the system trust store is not supported on this Linux"
+		return result
 	}
 
-	cmd := commandWithSudo("rm", "-f", m.systemTrustFilename())
-	out, err := cmd.CombinedOutput()
-	fatalIfCmdErr(err, "rm", out)
+	changed := false
+	filename := m.systemTrustFilename()
+	exists, matches, err := certificateFileMatches(filename, m.caCert)
+	if err != nil {
+		result.Status = resultFailed
+		result.Stage = "inspect system trust anchor"
+		result.Detail = err.Error()
+		return result
+	}
+	if exists && !matches {
+		result.Status = resultFailed
+		result.Stage = "inspect system trust anchor"
+		result.Detail = fmt.Sprintf("%s contains a different CA", filename)
+		return result
+	}
+	if exists {
+		cmd := commandWithSudo("rm", "-f", filename)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			result.Status = resultFailed
+			result.Stage = "remove system trust anchor"
+			result.Detail = fmt.Sprintf("%v: %s", err, strings.TrimSpace(string(out)))
+			return result
+		}
+		changed = true
+	}
 
-	// We used to install under non-unique filenames.
+	// We used to install under a non-unique filename. Never remove that
+	// legacy-looking file unless it contains this transaction's exact CA.
 	legacyFilename := fmt.Sprintf(SystemTrustFilename, "mkcert-rootCA")
-	if pathExists(legacyFilename) {
+	exists, matches, err = certificateFileMatches(legacyFilename, m.caCert)
+	if err != nil {
+		result.Status = resultFailed
+		result.Stage = "inspect legacy system trust anchor"
+		result.Detail = err.Error()
+		return result
+	}
+	if exists && !matches {
+		result.Status = resultFailed
+		result.Stage = "inspect legacy system trust anchor"
+		result.Detail = fmt.Sprintf("%s contains a different CA", legacyFilename)
+		return result
+	}
+	if exists {
 		cmd := commandWithSudo("rm", "-f", legacyFilename)
 		out, err := cmd.CombinedOutput()
-		fatalIfCmdErr(err, "rm (legacy filename)", out)
+		if err != nil {
+			result.Status = resultFailed
+			result.Stage = "remove legacy system trust anchor"
+			result.Detail = fmt.Sprintf("%v: %s", err, strings.TrimSpace(string(out)))
+			return result
+		}
+		changed = true
 	}
 
-	cmd = commandWithSudo(SystemTrustCommand...)
-	out, err = cmd.CombinedOutput()
-	fatalIfCmdErr(err, strings.Join(SystemTrustCommand, " "), out)
-
-	return true
+	cmd := commandWithSudo(SystemTrustCommand...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		result.Status = resultFailed
+		result.Stage = strings.Join(SystemTrustCommand, " ")
+		result.Detail = fmt.Sprintf("%v: %s", err, strings.TrimSpace(string(out)))
+		return result
+	}
+	if changed {
+		result.Status = resultRemoved
+	} else {
+		result.Status = resultAbsent
+	}
+	result.Stage = "refresh system trust store"
+	return result
 }
