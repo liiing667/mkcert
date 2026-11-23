@@ -15,6 +15,8 @@ import (
 	"crypto/x509/pkix"
 	"encoding/asn1"
 	"encoding/pem"
+	"errors"
+	"fmt"
 	"io/ioutil"
 	"log"
 	"math/big"
@@ -34,6 +36,8 @@ import (
 
 var userAndHostname string
 
+var errKeyCertificateMismatch = errors.New("certificate public key does not match the generated private key")
+
 func init() {
 	u, err := user.Current()
 	if err == nil {
@@ -51,9 +55,82 @@ func (m *mkcert) makeCert(hosts []string) {
 	if m.caKey == nil {
 		log.Fatalln("ERROR: can't create new certificates because the CA key (rootCA-key.pem) is missing")
 	}
+	if m.caCert == nil {
+		log.Fatalln("ERROR: can't create new certificates because the CA certificate (rootCA.pem) is missing")
+	}
 
+	lock, err := lockOutputs(m.CAROOT)
+	fatalIfErr(err, "failed to lock certificate output")
+	defer lock.unlock()
+	fatalIfErr(m.makeCertLocked(hosts), "failed to create certificate")
+}
+
+func (m *mkcert) makeCertLocked(hosts []string) error {
+	certFile, keyFile, p12File := m.fileNames(hosts)
+	outputs := []string{certFile, keyFile}
+	if m.pkcs12 {
+		outputs = []string{p12File}
+	}
+	tx, err := m.issueCertificate(hosts)
+	if err != nil {
+		return fmt.Errorf("failed to issue certificate: %w", err)
+	}
+	if err := tx.write(outputs); err != nil {
+		return fmt.Errorf("failed to save certificate: %w", err)
+	}
+	defer tx.cleanup()
+
+	// Verify the artifact that an importing consumer will actually parse. This
+	// happens before the transaction is committed, so an encoding/write failure
+	// cannot leave a key, leaf or CA chain from a different generation behind.
+	if err := tx.verify(m.pkcs12, m.caCert); err != nil {
+		return err
+	}
+	if err := tx.commit(); err != nil {
+		return fmt.Errorf("failed to save certificate: %w", err)
+	}
+	// The transaction has committed, so deferred cleanup must not remove a
+	// published destination. Future errors after this point do not roll back.
+	tx.files = nil
+
+	m.printHosts(hosts)
+
+	if !m.pkcs12 {
+		if certFile == keyFile {
+			log.Printf("\nThe certificate and key are at \"%s\" ✅\n\n", certFile)
+		} else {
+			log.Printf("\nThe certificate is at \"%s\" and the key at \"%s\" ✅\n\n", certFile, keyFile)
+		}
+	} else {
+		log.Printf("\nThe PKCS#12 bundle is at \"%s\" ✅\n", p12File)
+		log.Printf("\nThe legacy PKCS#12 encryption password is the often hardcoded default \"changeit\" ℹ️\n\n")
+	}
+
+	log.Printf("It will expire on %s 🗓\n\n", tx.expiration.Format("2 January 2006"))
+}
+
+// certificateTransaction bundles every object and encoded artifact produced
+// for one certificate generation. None of its outputs become visible until
+// commit succeeds, so retries always replace the whole previous generation
+// rather than mixing an old key with a new leaf.
+type certificateTransaction struct {
+	key  crypto.PrivateKey
+	leaf *x509.Certificate
+
+	expiration time.Time
+
+	certPEM []byte
+	keyPEM  []byte
+	p12     []byte
+
+	files []atomicOutputFile
+}
+
+func (m *mkcert) issueCertificate(hosts []string) (*certificateTransaction, error) {
 	priv, err := m.generateKey(false)
-	fatalIfErr(err, "failed to generate certificate key")
+	if err != nil {
+		return nil, err
+	}
 	pub := priv.(crypto.Signer).Public()
 
 	// Certificates last for 2 years and 3 months, which is always less than
@@ -101,48 +178,122 @@ func (m *mkcert) makeCert(hosts []string) {
 		tpl.Subject.CommonName = hosts[0]
 	}
 
-	cert, err := x509.CreateCertificate(rand.Reader, tpl, m.caCert, pub, m.caKey)
-	fatalIfErr(err, "failed to generate certificate")
-
-	certFile, keyFile, p12File := m.fileNames(hosts)
-
-	if !m.pkcs12 {
-		certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert})
-		privDER, err := x509.MarshalPKCS8PrivateKey(priv)
-		fatalIfErr(err, "failed to encode certificate key")
-		privPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: privDER})
-
-		if certFile == keyFile {
-			err = ioutil.WriteFile(keyFile, append(certPEM, privPEM...), 0600)
-			fatalIfErr(err, "failed to save certificate and key")
-		} else {
-			err = ioutil.WriteFile(certFile, certPEM, 0644)
-			fatalIfErr(err, "failed to save certificate")
-			err = ioutil.WriteFile(keyFile, privPEM, 0600)
-			fatalIfErr(err, "failed to save certificate key")
-		}
-	} else {
-		domainCert, _ := x509.ParseCertificate(cert)
-		pfxData, err := pkcs12.Encode(rand.Reader, priv, domainCert, []*x509.Certificate{m.caCert}, "changeit")
-		fatalIfErr(err, "failed to generate PKCS#12")
-		err = ioutil.WriteFile(p12File, pfxData, 0644)
-		fatalIfErr(err, "failed to save PKCS#12")
+	certDER, err := x509.CreateCertificate(rand.Reader, tpl, m.caCert, pub, m.caKey)
+	if err != nil {
+		return nil, err
+	}
+	leaf, err := x509.ParseCertificate(certDER)
+	if err != nil {
+		return nil, err
+	}
+	if !publicKeysEqual(leaf.PublicKey, pub) {
+		return nil, errKeyCertificateMismatch
 	}
 
-	m.printHosts(hosts)
+	tx := &certificateTransaction{key: priv, leaf: leaf, expiration: expiration}
+	tx.certPEM = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
 
-	if !m.pkcs12 {
-		if certFile == keyFile {
-			log.Printf("\nThe certificate and key are at \"%s\" ✅\n\n", certFile)
-		} else {
-			log.Printf("\nThe certificate is at \"%s\" and the key at \"%s\" ✅\n\n", certFile, keyFile)
+	keyDER, err := x509.MarshalPKCS8PrivateKey(priv)
+	if err != nil {
+		return nil, err
+	}
+	tx.keyPEM = pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
+
+	if m.pkcs12 {
+		tx.p12, err = pkcs12.Encode(rand.Reader, priv, leaf, []*x509.Certificate{m.caCert}, "changeit")
+		if err != nil {
+			return nil, err
 		}
-	} else {
-		log.Printf("\nThe PKCS#12 bundle is at \"%s\" ✅\n", p12File)
-		log.Printf("\nThe legacy PKCS#12 encryption password is the often hardcoded default \"changeit\" ℹ️\n\n")
 	}
 
-	log.Printf("It will expire on %s 🗓\n\n", expiration.Format("2 January 2006"))
+	return tx, nil
+}
+
+func (tx *certificateTransaction) write(outputs []string) error {
+	if tx == nil || len(outputs) == 0 {
+		return errors.New("no certificate output files")
+	}
+
+	if len(outputs) == 1 {
+		if len(tx.p12) == 0 {
+			return errors.New("PKCS#12 data was not generated")
+		}
+		tx.files = []atomicOutputFile{{path: outputs[0], data: tx.p12, perm: 0644}}
+	} else {
+		certFile, keyFile := outputs[0], outputs[1]
+		if certFile == keyFile {
+			data := make([]byte, 0, len(tx.certPEM)+len(tx.keyPEM))
+			data = append(data, tx.certPEM...)
+			data = append(data, tx.keyPEM...)
+			tx.files = []atomicOutputFile{{path: keyFile, data: data, perm: 0600}}
+		} else {
+			tx.files = []atomicOutputFile{
+				{path: certFile, data: tx.certPEM, perm: 0644},
+				{path: keyFile, data: tx.keyPEM, perm: 0600},
+			}
+		}
+	}
+
+	for i := range tx.files {
+		if err := writeAtomicFile(&tx.files[i]); err != nil {
+			tx.cleanup()
+			return err
+		}
+	}
+	return nil
+}
+
+func (tx *certificateTransaction) commit() error {
+	if len(tx.files) == 0 {
+		return errors.New("certificate transaction was not written")
+	}
+	for i := range tx.files {
+		if err := tx.files[i].commit(); err != nil {
+			for j := i - 1; j >= 0; j-- {
+				tx.files[j].rollback()
+			}
+			return err
+		}
+	}
+	return nil
+}
+
+func (tx *certificateTransaction) cleanup() {
+	for i := range tx.files {
+		tx.files[i].cleanup()
+	}
+}
+
+func (tx *certificateTransaction) verify(p12 bool, ca *x509.Certificate) error {
+	if !publicKeysEqual(tx.key.(crypto.Signer).Public(), tx.leaf.PublicKey) {
+		return errKeyCertificateMismatch
+	}
+	if err := tx.leaf.CheckSignatureFrom(ca); err != nil {
+		return fmt.Errorf("leaf is not signed by the transaction CA: %w", err)
+	}
+	if p12 {
+		parsedKey, parsedCert, parsedCA, err := pkcs12.DecodeChain(tx.p12, "changeit")
+		if err != nil {
+			return fmt.Errorf("failed to verify PKCS#12: %w", err)
+		}
+		signer, ok := parsedKey.(crypto.Signer)
+		if !ok {
+			return fmt.Errorf("failed to verify PKCS#12: parsed key type %T cannot sign", parsedKey)
+		}
+		if !publicKeysEqual(signer.Public(), tx.leaf.PublicKey) {
+			return fmt.Errorf("failed to verify PKCS#12: %w", errKeyCertificateMismatch)
+		}
+		if !parsedCert.Equal(tx.leaf) || len(parsedCA) != 1 || !parsedCA[0].Equal(ca) {
+			return errors.New("failed to verify PKCS#12: certificate or CA chain changed within the issuance transaction")
+		}
+	}
+	return nil
+}
+
+func publicKeysEqual(a, b crypto.PublicKey) bool {
+	aBytes, aErr := x509.MarshalPKIXPublicKey(a)
+	bBytes, bErr := x509.MarshalPKIXPublicKey(b)
+	return aErr == nil && bErr == nil && string(aBytes) == string(bBytes)
 }
 
 func (m *mkcert) printHosts(hosts []string) {

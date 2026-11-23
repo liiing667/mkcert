@@ -174,7 +174,10 @@ func (m *mkcert) Run(args []string) {
 		log.Fatalln("ERROR: failed to find the default CA location, set one as the CAROOT env var")
 	}
 	fatalIfErr(os.MkdirAll(m.CAROOT, 0755), "failed to create the CAROOT")
+	lock, err := lockOutputs(m.CAROOT)
+	fatalIfErr(err, "failed to lock CAROOT")
 	m.loadCA()
+	lock.unlock()
 
 	if m.installMode {
 		m.install()
