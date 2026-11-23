@@ -174,6 +174,12 @@ func (m *mkcert) Run(args []string) {
 		log.Fatalln("ERROR: failed to find the default CA location, set one as the CAROOT env var")
 	}
 	fatalIfErr(os.MkdirAll(m.CAROOT, 0755), "failed to create the CAROOT")
+	// CA creation, loading and leaf issuance for one CAROOT are a single
+	// transaction. Without this lock, two concurrent first runs can create two
+	// different CAs and leave a key/certificate pair from different runs on disk.
+	caLock, err := lockCAROOT(m.CAROOT)
+	fatalIfErr(err, "failed to lock the CAROOT")
+	defer caLock.unlock()
 	m.loadCA()
 
 	if m.installMode {
