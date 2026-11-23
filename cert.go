@@ -176,6 +176,10 @@ func (m *mkcert) generateKey(rootCA bool) (crypto.PrivateKey, error) {
 func (m *mkcert) fileNames(hosts []string) (certFile, keyFile, p12File string) {
 	defaultName := strings.Replace(hosts[0], ":", "_", -1)
 	defaultName = strings.Replace(defaultName, "*", "_wildcard", -1)
+	// URI SANs can contain path separators. Keep the default output name in
+	// the current directory instead of turning the SAN into a path.
+	defaultName = strings.Replace(defaultName, "/", "_", -1)
+	defaultName = strings.Replace(defaultName, "\\", "_", -1)
 	if len(hosts) > 1 {
 		defaultName += "+" + strconv.Itoa(len(hosts)-1)
 	}
@@ -207,75 +211,9 @@ func randomSerialNumber() *big.Int {
 }
 
 func (m *mkcert) makeCertFromCSR() {
-	if m.caKey == nil {
-		log.Fatalln("ERROR: can't create new certificates because the CA key (rootCA-key.pem) is missing")
+	if err := m.makeCertFromCSRLocked(); err != nil {
+		log.Fatalf("ERROR: %s", err)
 	}
-
-	csrPEMBytes, err := ioutil.ReadFile(m.csrPath)
-	fatalIfErr(err, "failed to read the CSR")
-	csrPEM, _ := pem.Decode(csrPEMBytes)
-	if csrPEM == nil {
-		log.Fatalln("ERROR: failed to read the CSR: unexpected content")
-	}
-	if csrPEM.Type != "CERTIFICATE REQUEST" &&
-		csrPEM.Type != "NEW CERTIFICATE REQUEST" {
-		log.Fatalln("ERROR: failed to read the CSR: expected CERTIFICATE REQUEST, got " + csrPEM.Type)
-	}
-	csr, err := x509.ParseCertificateRequest(csrPEM.Bytes)
-	fatalIfErr(err, "failed to parse the CSR")
-	fatalIfErr(csr.CheckSignature(), "invalid CSR signature")
-
-	expiration := time.Now().AddDate(2, 3, 0)
-	tpl := &x509.Certificate{
-		SerialNumber:    randomSerialNumber(),
-		Subject:         csr.Subject,
-		ExtraExtensions: csr.Extensions, // includes requested SANs, KUs and EKUs
-
-		NotBefore: time.Now(), NotAfter: expiration,
-
-		// If the CSR does not request a SAN extension, fix it up for them as
-		// the Common Name field does not work in modern browsers. Otherwise,
-		// this will get overridden.
-		DNSNames: []string{csr.Subject.CommonName},
-
-		// Likewise, if the CSR does not set KUs and EKUs, fix it up as Apple
-		// platforms require serverAuth for TLS.
-		KeyUsage:    x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
-		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-	}
-
-	if m.client {
-		tpl.ExtKeyUsage = append(tpl.ExtKeyUsage, x509.ExtKeyUsageClientAuth)
-	}
-	if len(csr.EmailAddresses) > 0 {
-		tpl.ExtKeyUsage = append(tpl.ExtKeyUsage, x509.ExtKeyUsageEmailProtection)
-	}
-
-	cert, err := x509.CreateCertificate(rand.Reader, tpl, m.caCert, csr.PublicKey, m.caKey)
-	fatalIfErr(err, "failed to generate certificate")
-	c, err := x509.ParseCertificate(cert)
-	fatalIfErr(err, "failed to parse generated certificate")
-
-	var hosts []string
-	hosts = append(hosts, c.DNSNames...)
-	hosts = append(hosts, c.EmailAddresses...)
-	for _, ip := range c.IPAddresses {
-		hosts = append(hosts, ip.String())
-	}
-	for _, uri := range c.URIs {
-		hosts = append(hosts, uri.String())
-	}
-	certFile, _, _ := m.fileNames(hosts)
-
-	err = ioutil.WriteFile(certFile, pem.EncodeToMemory(
-		&pem.Block{Type: "CERTIFICATE", Bytes: cert}), 0644)
-	fatalIfErr(err, "failed to save certificate")
-
-	m.printHosts(hosts)
-
-	log.Printf("\nThe certificate is at \"%s\" ✅\n\n", certFile)
-
-	log.Printf("It will expire on %s 🗓\n\n", expiration.Format("2 January 2006"))
 }
 
 // loadCA will load or create the CA at CAROOT.

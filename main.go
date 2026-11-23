@@ -178,7 +178,7 @@ func (m *mkcert) Run(args []string) {
 
 	if m.installMode {
 		m.install()
-		if len(args) == 0 {
+		if len(args) == 0 && m.csrPath == "" {
 			return
 		}
 	} else if m.uninstallMode {
