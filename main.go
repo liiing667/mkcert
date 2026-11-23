@@ -174,6 +174,12 @@ func (m *mkcert) Run(args []string) {
 		log.Fatalln("ERROR: failed to find the default CA location, set one as the CAROOT env var")
 	}
 	fatalIfErr(os.MkdirAll(m.CAROOT, 0755), "failed to create the CAROOT")
+	// Serialize CA creation, recovery and installation across concurrent
+	// mkcert invocations sharing this CAROOT. Together with the atomic CA
+	// file writes this turns the whole operation into one transaction.
+	lock, err := lockCAROOT(m.CAROOT)
+	fatalIfErr(err, "failed to lock the CAROOT")
+	defer lock.unlock()
 	m.loadCA()
 
 	if m.installMode {
