@@ -10,6 +10,7 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/hex"
+	"fmt"
 	"hash"
 	"os"
 	"os/exec"
@@ -54,9 +55,9 @@ func init() {
 	}
 }
 
-func (m *mkcert) checkJava() bool {
-	if !hasKeytool {
-		return false
+func (m *mkcert) checkJava() (bool, error) {
+	if !hasKeytool || cacertsPath == "" {
+		return false, nil
 	}
 
 	// exists returns true if the given x509.Certificate's fingerprint
@@ -68,41 +69,49 @@ func (m *mkcert) checkJava() bool {
 	}
 
 	keytoolOutput, err := exec.Command(keytoolPath, "-list", "-keystore", cacertsPath, "-storepass", storePass).CombinedOutput()
-	fatalIfCmdErr(err, "keytool -list", keytoolOutput)
+	if err != nil {
+		return false, fmt.Errorf("keytool -list: %v\n\n%s", err, keytoolOutput)
+	}
 	// keytool outputs SHA1 and SHA256 (Java 9+) certificates in uppercase hex
 	// with each octet pair delimitated by ":". Drop them from the keytool output
 	keytoolOutput = bytes.Replace(keytoolOutput, []byte(":"), nil, -1)
 
 	// pre-Java 9 uses SHA1 fingerprints
 	s1, s256 := sha1.New(), sha256.New()
-	return exists(m.caCert, s1, keytoolOutput) || exists(m.caCert, s256, keytoolOutput)
+	return exists(m.caCert, s1, keytoolOutput) || exists(m.caCert, s256, keytoolOutput), nil
 }
 
-func (m *mkcert) installJava() {
+func (m *mkcert) installJava(caFile string) error {
 	args := []string{
 		"-importcert", "-noprompt",
 		"-keystore", cacertsPath,
 		"-storepass", storePass,
-		"-file", filepath.Join(m.CAROOT, rootName),
+		"-file", caFile,
 		"-alias", m.caUniqueName(),
 	}
 
 	out, err := execKeytool(exec.Command(keytoolPath, args...))
-	fatalIfCmdErr(err, "keytool -importcert", out)
+	if err != nil {
+		return fmt.Errorf("keytool -importcert: %v\n\n%s", err, out)
+	}
+	return nil
 }
 
-func (m *mkcert) uninstallJava() {
+func (m *mkcert) uninstallJava(alias string) (bool, error) {
 	args := []string{
 		"-delete",
-		"-alias", m.caUniqueName(),
+		"-alias", alias,
 		"-keystore", cacertsPath,
 		"-storepass", storePass,
 	}
 	out, err := execKeytool(exec.Command(keytoolPath, args...))
 	if bytes.Contains(out, []byte("does not exist")) {
-		return // cert didn't exist
+		return false, nil // cert didn't exist
 	}
-	fatalIfCmdErr(err, "keytool -delete", out)
+	if err != nil {
+		return false, fmt.Errorf("keytool -delete: %v\n\n%s", err, out)
+	}
+	return true, nil
 }
 
 // execKeytool will execute a "keytool" command and if needed re-execute

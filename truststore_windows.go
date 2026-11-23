@@ -11,7 +11,6 @@ import (
 	"io/ioutil"
 	"math/big"
 	"os"
-	"path/filepath"
 	"syscall"
 	"unsafe"
 )
@@ -32,38 +31,48 @@ var (
 	procCertOpenSystemStoreW             = modcrypt32.NewProc("CertOpenSystemStoreW")
 )
 
-func (m *mkcert) installPlatform() bool {
+func (m *mkcert) installPlatform(caFile string) error {
 	// Load cert
-	cert, err := ioutil.ReadFile(filepath.Join(m.CAROOT, rootName))
-	fatalIfErr(err, "failed to read root certificate")
+	cert, err := ioutil.ReadFile(caFile)
+	if err != nil {
+		return fmt.Errorf("failed to read root certificate: %w", err)
+	}
 	// Decode PEM
 	if certBlock, _ := pem.Decode(cert); certBlock == nil || certBlock.Type != "CERTIFICATE" {
-		fatalIfErr(fmt.Errorf("invalid PEM data"), "decode pem")
+		return fmt.Errorf("decode pem: invalid PEM data")
 	} else {
 		cert = certBlock.Bytes
 	}
 	// Open root store
 	store, err := openWindowsRootStore()
-	fatalIfErr(err, "open root store")
+	if err != nil {
+		return fmt.Errorf("open root store: %w", err)
+	}
 	defer store.close()
 	// Add cert
-	fatalIfErr(store.addCert(cert), "add cert")
-	return true
+	if err := store.addCert(cert); err != nil {
+		return fmt.Errorf("add cert: %w", err)
+	}
+	return nil
 }
 
-func (m *mkcert) uninstallPlatform() bool {
+func (m *mkcert) uninstallPlatform(caFile string) (bool, error) {
 	// We'll just remove all certs with the same serial number
 	// Open root store
 	store, err := openWindowsRootStore()
-	fatalIfErr(err, "open root store")
+	if err != nil {
+		return false, fmt.Errorf("open root store: %w", err)
+	}
 	defer store.close()
 	// Do the deletion
 	deletedAny, err := store.deleteCertsWithSerial(m.caCert.SerialNumber)
-	if err == nil && !deletedAny {
-		err = fmt.Errorf("no certs found")
+	if err != nil {
+		return deletedAny, fmt.Errorf("delete cert: %w", err)
 	}
-	fatalIfErr(err, "delete cert")
-	return true
+	if !deletedAny {
+		return false, errCertNotInstalled
+	}
+	return true, nil
 }
 
 type windowsRootStore uintptr

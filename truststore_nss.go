@@ -6,7 +6,7 @@ package main
 
 import (
 	"bytes"
-	"log"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -75,44 +75,53 @@ func (m *mkcert) checkNSS() bool {
 		return false
 	}
 	success := true
-	if m.forEachNSSProfile(func(profile string) {
+	found, err := m.forEachNSSProfile(func(profile string) error {
 		err := exec.Command(certutilPath, "-V", "-d", profile, "-u", "L", "-n", m.caUniqueName()).Run()
 		if err != nil {
 			success = false
 		}
-	}) == 0 {
-		success = false
-	}
-	return success
+		return nil
+	})
+	return err == nil && found > 0 && success
 }
 
-func (m *mkcert) installNSS() bool {
-	if m.forEachNSSProfile(func(profile string) {
-		cmd := exec.Command(certutilPath, "-A", "-d", profile, "-t", "C,,", "-n", m.caUniqueName(), "-i", filepath.Join(m.CAROOT, rootName))
+func (m *mkcert) installNSS(caFile string) error {
+	found, err := m.forEachNSSProfile(func(profile string) error {
+		cmd := exec.Command(certutilPath, "-A", "-d", profile, "-t", "C,,", "-n", m.caUniqueName(), "-i", caFile)
 		out, err := execCertutil(cmd)
-		fatalIfCmdErr(err, "certutil -A -d "+profile, out)
-	}) == 0 {
-		log.Printf("ERROR: no %s security databases found", NSSBrowsers)
-		return false
+		if err != nil {
+			return fmt.Errorf("certutil -A -d %s: %v\n\n%s", profile, err, out)
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if found == 0 {
+		return errNoNSSProfiles
 	}
 	if !m.checkNSS() {
-		log.Printf("Installing in %s failed. Please report the issue with details about your environment at https://github.com/FiloSottile/mkcert/issues/new 👎", NSSBrowsers)
-		log.Printf("Note that if you never started %s, you need to do that at least once.", NSSBrowsers)
-		return false
+		return errNSSVerification
 	}
-	return true
+	return nil
 }
 
-func (m *mkcert) uninstallNSS() {
-	m.forEachNSSProfile(func(profile string) {
-		err := exec.Command(certutilPath, "-V", "-d", profile, "-u", "L", "-n", m.caUniqueName()).Run()
+func (m *mkcert) uninstallNSS(alias string) (int, error) {
+	removed := 0
+	_, err := m.forEachNSSProfile(func(profile string) error {
+		err := exec.Command(certutilPath, "-V", "-d", profile, "-u", "L", "-n", alias).Run()
 		if err != nil {
-			return
+			return nil
 		}
-		cmd := exec.Command(certutilPath, "-D", "-d", profile, "-n", m.caUniqueName())
+		cmd := exec.Command(certutilPath, "-D", "-d", profile, "-n", alias)
 		out, err := execCertutil(cmd)
-		fatalIfCmdErr(err, "certutil -D -d "+profile, out)
+		if err != nil {
+			return fmt.Errorf("certutil -D -d %s: %v\n\n%s", profile, err, out)
+		}
+		removed++
+		return nil
 	})
+	return removed, err
 }
 
 // execCertutil will execute a "certutil" command and if needed re-execute
@@ -128,7 +137,7 @@ func execCertutil(cmd *exec.Cmd) ([]byte, error) {
 	return out, err
 }
 
-func (m *mkcert) forEachNSSProfile(f func(profile string)) (found int) {
+func (m *mkcert) forEachNSSProfile(f func(profile string) error) (found int, err error) {
 	var profiles []string
 	profiles = append(profiles, nssDBs...)
 	for _, ff := range FirefoxProfiles {
@@ -140,12 +149,16 @@ func (m *mkcert) forEachNSSProfile(f func(profile string)) (found int) {
 			continue
 		}
 		if pathExists(filepath.Join(profile, "cert9.db")) {
-			f("sql:" + profile)
+			if err := f("sql:" + profile); err != nil {
+				return found, err
+			}
 			found++
 		} else if pathExists(filepath.Join(profile, "cert8.db")) {
-			f("dbm:" + profile)
+			if err := f("dbm:" + profile); err != nil {
+				return found, err
+			}
 			found++
 		}
 	}
-	return
+	return found, nil
 }

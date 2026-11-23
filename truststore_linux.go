@@ -8,9 +8,7 @@ import (
 	"bytes"
 	"fmt"
 	"io/ioutil"
-	"log"
 	"os"
-	"path/filepath"
 	"strings"
 )
 
@@ -52,48 +50,84 @@ func (m *mkcert) systemTrustFilename() string {
 	return fmt.Sprintf(SystemTrustFilename, strings.Replace(m.caUniqueName(), " ", "_", -1))
 }
 
-func (m *mkcert) installPlatform() bool {
+func (m *mkcert) installPlatform(caFile string) error {
 	if SystemTrustCommand == nil {
-		log.Printf("Installing to the system store is not yet supported on this Linux 😣 but %s will still work.", NSSBrowsers)
-		log.Printf("You can also manually install the root certificate at %q.", filepath.Join(m.CAROOT, rootName))
-		return false
+		return errStoreUnsupported
 	}
 
-	cert, err := ioutil.ReadFile(filepath.Join(m.CAROOT, rootName))
-	fatalIfErr(err, "failed to read root certificate")
+	cert, err := ioutil.ReadFile(caFile)
+	if err != nil {
+		return fmt.Errorf("failed to read root certificate: %w", err)
+	}
 
 	cmd := commandWithSudo("tee", m.systemTrustFilename())
 	cmd.Stdin = bytes.NewReader(cert)
 	out, err := cmd.CombinedOutput()
-	fatalIfCmdErr(err, "tee", out)
+	if err != nil {
+		return fmt.Errorf("failed to execute \"tee\": %v\n\n%s", err, out)
+	}
 
 	cmd = commandWithSudo(SystemTrustCommand...)
 	out, err = cmd.CombinedOutput()
-	fatalIfCmdErr(err, strings.Join(SystemTrustCommand, " "), out)
+	if err != nil {
+		return fmt.Errorf("failed to execute \"%s\": %v\n\n%s", strings.Join(SystemTrustCommand, " "), err, out)
+	}
 
-	return true
+	return nil
 }
 
-func (m *mkcert) uninstallPlatform() bool {
+func (m *mkcert) uninstallPlatform(caFile string) (bool, error) {
 	if SystemTrustCommand == nil {
-		return false
+		return false, errStoreUnsupported
 	}
 
-	cmd := commandWithSudo("rm", "-f", m.systemTrustFilename())
-	out, err := cmd.CombinedOutput()
-	fatalIfCmdErr(err, "rm", out)
+	removed := false
+	filename := m.systemTrustFilename()
+	if pathExists(filename) {
+		cmd := commandWithSudo("rm", "-f", filename)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			return false, fmt.Errorf("failed to execute \"rm\": %v\n\n%s", err, out)
+		}
+		removed = true
+	}
 
-	// We used to install under non-unique filenames.
+	// We used to install under non-unique filenames. Only remove the legacy
+	// file if it still contains the CA we are uninstalling, so rotating the
+	// CA doesn't delete an older generation that is still trusted.
 	legacyFilename := fmt.Sprintf(SystemTrustFilename, "mkcert-rootCA")
-	if pathExists(legacyFilename) {
+	if legacyFilename != filename && pathExists(legacyFilename) {
+		legacyCert, err := ioutil.ReadFile(legacyFilename)
+		if err != nil {
+			return removed, fmt.Errorf("failed to read the legacy root certificate: %w", err)
+		}
+		currentCert, err := ioutil.ReadFile(caFile)
+		if err != nil {
+			return removed, fmt.Errorf("failed to read the transaction CA certificate: %w", err)
+		}
+		if !bytes.Equal(legacyCert, currentCert) {
+			if !removed {
+				return false, errCertNotInstalled
+			}
+			return removed, nil
+		}
 		cmd := commandWithSudo("rm", "-f", legacyFilename)
 		out, err := cmd.CombinedOutput()
-		fatalIfCmdErr(err, "rm (legacy filename)", out)
+		if err != nil {
+			return removed, fmt.Errorf("failed to execute \"rm (legacy filename)\": %v\n\n%s", err, out)
+		}
+		removed = true
 	}
 
-	cmd = commandWithSudo(SystemTrustCommand...)
-	out, err = cmd.CombinedOutput()
-	fatalIfCmdErr(err, strings.Join(SystemTrustCommand, " "), out)
+	if !removed {
+		return false, errCertNotInstalled
+	}
 
-	return true
+	cmd := commandWithSudo(SystemTrustCommand...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return true, fmt.Errorf("failed to execute \"%s\": %v\n\n%s", strings.Join(SystemTrustCommand, " "), err, out)
+	}
+
+	return true, nil
 }
